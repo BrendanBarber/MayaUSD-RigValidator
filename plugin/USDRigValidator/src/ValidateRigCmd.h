@@ -81,4 +81,43 @@ private:
 	std::vector<USDSkeletonData> parseAllUSDSkels(const MString& filePath);
 	std::unique_ptr<MayaSkeletonData> parseMayaSkel(const MDagPath& root);
 	std::unique_ptr<MayaSkinBindingData> parseMayaSkin(const MDagPath& meshPath);
+
+	bool quickValidateSkeleton(const USDSkeletonData& usdSkel, const MayaSkeletonData& mayaSkel);
+	bool quickValidateSkinBinding(const USDSkinBindingData& usdSkin, const MayaSkinBindingData& mayaSkin);
+
+	struct ValidationIssue {
+		enum class Type {
+			JOINT_COUNT_MISMATCH,
+			JOINT_NAME_MISMATCH,
+			PARENT_INDEX_MISMATCH,
+			BIND_TRANSFORM_MISMATCH,
+			REST_TRANSFORM_MISMATCH,
+			WEIGHT_COUNT_MISMATCH,
+			JOINT_INDEX_MISMATCH,
+			WEIGHT_VALUE_MISMATCH,
+			GEOM_BIND_TRANSFORM_MISMATCH
+		};
+
+		Type type;
+		MString description;
+		int index;
+
+		ValidationIssue(Type t, const MString& desc, int idx = -1) :
+			type(t), description(desc), index(idx) {}
+	};
+
+	std::vector<ValidationIssue> detailedValidateSkeleton(
+		const USDSkeletonData& usdSkel,
+		const MayaSkeletonData& mayaSkel
+	);
+	std::vector<ValidationIssue> detailedValidateSkinBinding(
+		const USDSkinBindingData& usdSkin,
+		const MayaSkinBindingData& mayaSkin
+	);
+
+	static bool matricesMatch(const GfMatrix4d& usdMat,
+		const MMatrix& mayaMat,
+		double tolerance = 1e-6);
+
+	MMatrix getBindMatrixForJoint(const MDagPath& jointPath, MStatus& status);
 };

@@ -1,12 +1,14 @@
 #include "ValidateRigCmd.h"
 
 #include <memory>
+#include <cstdlib>
 #include <maya/MGlobal.h>
 #include <maya/MString.h>
 #include <maya/MFnDagNode.h>
 #include <maya/MDagPath.h>
 #include <maya/MObject.h>
 #include <maya/MStatus.h>
+#include <maya/MFnDependencyNode.h>
 #include <maya/MItDependencyNodes.h>
 #include <maya/MFnSkinCluster.h>
 #include <maya/MFnTransform.h>
@@ -193,6 +195,14 @@ std::unique_ptr<ValidateRigCmd::MayaSkeletonData> ValidateRigCmd::parseMayaSkel(
 	std::vector<MDagPath> jointPaths;
 	std::map<std::string, int> jointNameToIndex;
 
+	// Get root world matrix, used for rest transform calculation
+	MMatrix rootWorldMatrix = root.inclusiveMatrix(&status);
+	if (status != MS::kSuccess) {
+		MGlobal::displayError("Failed to get root world matrix");
+		return nullptr;
+	}
+	MMatrix rootWorldInverse = rootWorldMatrix.inverse();
+
 	// Recursively traverse the joint hierarchy
 	std::function<void(const MDagPath&)> traverseJoints = [&](const MDagPath dagPath) {
 		MFnDagNode dagNode(dagPath, &status);
@@ -248,22 +258,22 @@ std::unique_ptr<ValidateRigCmd::MayaSkeletonData> ValidateRigCmd::parseMayaSkel(
 		}
 		skelData->jointParentIndices.append(parentIndex);
 
-		// Rest transform (local transform)
-		MTransformationMatrix restXform = joint.transformation(&status);
-		if (status != MS::kSuccess) {
-			MGlobal::displayError("Failed to get transformation for: " + jointPath.partialPathName());
-			return nullptr;
-		}
-		skelData->restTransforms.append(restXform.asMatrix());
-
-		// Bind transform (inverse bind matrix from skin cluster)
-		// TODO: Query the skin cluster's bind pre-matrix
-		MMatrix worldMatrix = jointPath.inclusiveMatrix(&status);
+		// Rest transform
+		MMatrix jointWorldMatrix = jointPath.inclusiveMatrix(&status);
 		if (status != MS::kSuccess) {
 			MGlobal::displayError("Failed to get world matrix for: " + jointPath.partialPathName());
 			return nullptr;
 		}
-		skelData->bindTransforms.append(worldMatrix);
+		MMatrix skelSpaceRestMatrix = jointWorldMatrix * rootWorldInverse;
+		skelData->restTransforms.append(skelSpaceRestMatrix);
+
+		// Bind transform (inverse bind matrix from skin cluster)
+		MMatrix bindMatrix = getBindMatrixForJoint(jointPath, status);
+		if (status != MS::kSuccess) {
+			MGlobal::displayError("Failed to get bind matrix for: " + jointPath.partialPathName());
+			return nullptr;
+		}
+		skelData->bindTransforms.append(bindMatrix);
 	}
 
 	MGlobal::displayInfo(MString("Parsed Maya skeleton with ") +
@@ -400,4 +410,296 @@ std::unique_ptr<ValidateRigCmd::MayaSkinBindingData> ValidateRigCmd::parseMayaSk
 	data->jointWeights.setLength(arrayIndex);
 
 	return data;
+}
+
+bool ValidateRigCmd::quickValidateSkeleton(const USDSkeletonData& usdSkel, const MayaSkeletonData& mayaSkel) 
+{
+	// Fastest checks
+	if (usdSkel.jointNames.size() != mayaSkel.jointNames.length()) return false;
+	if (usdSkel.jointParentIndices.size() != mayaSkel.jointParentIndices.length()) return false;
+	if (usdSkel.bindTransforms.size() != mayaSkel.bindTransforms.length()) return false;
+
+	// Slower checks
+	for (size_t i = 0; i < usdSkel.jointNames.size(); ++i) {
+		if (usdSkel.jointNames[i] != mayaSkel.jointNames[i].asChar())
+			return false;
+	}
+
+	for (size_t i = 0; i < usdSkel.jointParentIndices.size(); ++i) {
+		if (usdSkel.jointParentIndices[i] != mayaSkel.jointParentIndices[i])
+			return false;
+	}
+
+	// Slowest checks
+	for (size_t i = 0; i < usdSkel.bindTransforms.size(); ++i) {
+		if (!matricesMatch(usdSkel.bindTransforms[i], mayaSkel.bindTransforms[i]))
+			return false;
+	}
+
+	for (size_t i = 0; i < usdSkel.restTransforms.size(); ++i) {
+		if (!matricesMatch(usdSkel.restTransforms[i], mayaSkel.restTransforms[i]))
+			return false;
+	}
+
+	return true;
+}
+
+std::vector<ValidateRigCmd::ValidationIssue> ValidateRigCmd::detailedValidateSkeleton(
+	const USDSkeletonData& usdSkel, const MayaSkeletonData& mayaSkel
+)
+{
+	std::vector<ValidationIssue> issues;
+
+	// Joint count
+	if (usdSkel.jointNames.size() != mayaSkel.jointNames.length()) {
+		MString desc;
+		desc.format("Joint count mismatch: USD has ^1s joints, Maya has ^2s joints",
+			MString() + (int)usdSkel.jointNames.size(),
+			MString() + mayaSkel.jointNames.length());
+		issues.emplace_back(ValidationIssue::Type::JOINT_COUNT_MISMATCH, desc);
+		
+		return issues; // For loops later won't work with number mismatch, return early 
+	}
+
+	// Joint names
+	for (size_t i = 0; i < usdSkel.jointNames.size(); ++i) {
+		if (usdSkel.jointNames[i] != mayaSkel.jointNames[i].asChar()) {
+			MString desc;
+			desc.format("Joint ^1s name mismatch: USD=''^2s'', Maya=''^3s''",
+				MString() + (int)i,
+				MString(usdSkel.jointNames[i].GetString().c_str()),
+				mayaSkel.jointNames[i]);
+			issues.emplace_back(ValidationIssue::Type::JOINT_NAME_MISMATCH, desc, i);
+		}
+	}
+
+	// Parent indices
+	for (size_t i = 0; i < usdSkel.jointParentIndices.size(); ++i) {
+		if (usdSkel.jointParentIndices[i] != mayaSkel.jointParentIndices[i]) {
+			MString desc;
+			desc.format("Joint ^1s parent index mismatch: USD=^2s, Maya^3s",
+				MString() + (int)i,
+				MString() + usdSkel.jointParentIndices[i],
+				MString() + mayaSkel.jointParentIndices[i]);
+			issues.emplace_back(ValidationIssue::Type::PARENT_INDEX_MISMATCH, desc, i);
+		}
+	}
+
+	// Bind Transforms
+	for (size_t i = 0; i < usdSkel.bindTransforms.size(); ++i) {
+		if (!matricesMatch(usdSkel.bindTransforms[i], mayaSkel.bindTransforms[i])) {
+			MString desc;
+			desc.format("Joint ^1s (^2s) bind transform mismatch",
+				MString() + (int)i,
+				mayaSkel.jointNames[i]);
+			issues.emplace_back(ValidationIssue::Type::BIND_TRANSFORM_MISMATCH, desc, i);
+		}
+	}
+	
+	// Rest transforms
+	for (size_t i = 0; i < usdSkel.restTransforms.size(); ++i) {
+		if (!matricesMatch(usdSkel.restTransforms[i], mayaSkel.restTransforms[i])) {
+			MString desc;
+			desc.format("Joint ^1s (^2s) rest transform mismatch",
+				MString() + (int)i,
+				mayaSkel.jointNames[i]);
+			issues.emplace_back(ValidationIssue::Type::REST_TRANSFORM_MISMATCH, desc, i);
+		}
+	}
+
+	return issues;
+}
+
+bool ValidateRigCmd::quickValidateSkinBinding(
+	const USDSkinBindingData& usdSkin,
+	const MayaSkinBindingData& mayaSkin) 
+{
+	// Quick checks
+	if (usdSkin.jointIndices.size() != mayaSkin.jointIndices.length()) return false;
+
+	if (usdSkin.jointWeights.size() != mayaSkin.jointWeights.length()) return false;
+
+	// Joint indices
+	for (size_t i = 0; i < usdSkin.jointIndices.size(); ++i) {
+		if (usdSkin.jointIndices[i] != mayaSkin.jointIndices[i]) return false;
+	}
+
+	// Joint weights
+	const float weightTolerance = 1e-5f;
+	for (size_t i = 0; i < usdSkin.jointWeights.size(); ++i) {
+		float diff = std::abs(usdSkin.jointWeights[i] - mayaSkin.jointWeights[i]);
+		if (diff > weightTolerance) {
+			return false;
+		}
+	}
+
+	// Geometry bind transform
+	if (!matricesMatch(usdSkin.geomBindTransform, mayaSkin.geomBindTransform)) return false;
+
+	return true;
+}
+
+std::vector<ValidateRigCmd::ValidationIssue> ValidateRigCmd::detailedValidateSkinBinding(
+	const USDSkinBindingData& usdSkin,
+	const MayaSkinBindingData& mayaSkin
+)
+{
+	std::vector<ValidationIssue> issues;
+
+	// Joint indices count
+	if (usdSkin.jointIndices.size() != mayaSkin.jointIndices.length()) {
+		MString desc;
+		desc.format("Joint indices count mismatch: USD has ^1s, Maya has ^2s",
+			MString() + (int)usdSkin.jointIndices.size(),
+			MString() + mayaSkin.jointIndices.length());
+		issues.emplace_back(ValidationIssue::Type::WEIGHT_COUNT_MISMATCH, desc);
+		return issues; // For loops later won't work with number mismatch, return early 
+	}
+
+	// Joint weight count
+	if (usdSkin.jointWeights.size() != mayaSkin.jointWeights.length()) {
+		MString desc;
+		desc.format("Joint weights count mismatch: USD has ^1s, Maya has ^2s",
+			MString() + (int)usdSkin.jointWeights.size(),
+			MString() + mayaSkin.jointWeights.length());
+		issues.emplace_back(ValidationIssue::Type::WEIGHT_COUNT_MISMATCH, desc);
+		return issues; // For loops later won't work with number mismatch, return early 
+	}
+
+	// Compare joint indices
+	int indicesMismatchCount = 0;
+	for (size_t i = 0; i < usdSkin.jointIndices.size(); ++i) {
+		if (usdSkin.jointIndices[i] != mayaSkin.jointIndices[i]) {
+			indicesMismatchCount++;
+			// Only report first 5 mismatches
+			if (indicesMismatchCount <= 5) {
+				MString desc;
+				desc.format("Joint index mismatch at position ^1s: USD=^2s, Maya=^3s",
+					MString() + (int)i,
+					MString() + usdSkin.jointIndices[i],
+					MString() + mayaSkin.jointIndices[i]);
+				issues.emplace_back(ValidationIssue::Type::JOINT_INDEX_MISMATCH, desc, i);
+			}
+		}
+	}
+	if (indicesMismatchCount > 5) {
+		MString desc;
+		desc.format("... and ^1s more joint index mismatches (showing first 5 only)",
+			MString() + (indicesMismatchCount - 5));
+		issues.emplace_back(ValidationIssue::Type::JOINT_INDEX_MISMATCH, desc);
+	}
+
+	// Compare joint weights
+	const float weightTolerance = 1e-5f;
+	int weightsMismatchCount = 0;
+	for (size_t i = 0; i < usdSkin.jointWeights.size(); ++i) {
+		float diff = std::abs(usdSkin.jointWeights[i] - mayaSkin.jointWeights[i]);
+		if (diff > weightTolerance) {
+			weightsMismatchCount++;
+			// Only report first 5 mismatches to avoid spam
+			if (weightsMismatchCount <= 5) {
+				MString desc;
+				desc.format("Weight mismatch at position ^1s: USD=^2s, Maya=^3s (diff=^4s)",
+					MString() + (int)i,
+					MString() + usdSkin.jointWeights[i],
+					MString() + mayaSkin.jointWeights[i],
+					MString() + diff);
+				issues.emplace_back(ValidationIssue::Type::WEIGHT_VALUE_MISMATCH, desc, i);
+			}
+		}
+	}
+	if (weightsMismatchCount > 5) {
+		MString desc;
+		desc.format("... and ^1s more weight mismatches (showing first 5 only)",
+			MString() + (weightsMismatchCount - 5));
+		issues.emplace_back(ValidationIssue::Type::WEIGHT_VALUE_MISMATCH, desc);
+	}
+
+	// Geometry bind transform
+	if (!matricesMatch(usdSkin.geomBindTransform, mayaSkin.geomBindTransform)) {
+		MString desc("Geometry bind transform mismatch");
+		issues.emplace_back(ValidationIssue::Type::GEOM_BIND_TRANSFORM_MISMATCH, desc);
+	}
+
+	return issues;
+}
+
+bool ValidateRigCmd::matricesMatch(const GfMatrix4d& usdMat,
+	const MMatrix& mayaMat,
+	double tolerance)
+{
+	for (int row = 0; row < 4; ++row) {
+		for (int col = 0; col < 4; ++col) {
+			double diff = std::abs(usdMat[row][col] - mayaMat(row, col));
+			if (diff > tolerance)
+				return false;
+		}
+	}
+	return true;
+}
+
+MMatrix ValidateRigCmd::getBindMatrixForJoint(const MDagPath& jointPath, MStatus& status)
+{
+	status = MS::kFailure;
+
+	// Find all skin clusters in the scene
+	MItDependencyNodes itDep(MFn::kSkinClusterFilter, &status);
+	if (status != MS::kSuccess) return MMatrix::identity;
+
+	MString jointName = jointPath.partialPathName();
+
+	while (!itDep.isDone()) {
+		MObject skinClusterObj = itDep.thisNode();
+		MFnSkinCluster skinCluster(skinClusterObj, &status);
+		if (status != MS::kSuccess) {
+			itDep.next();
+			continue;
+		}
+
+		// Get all influence objects for this skin cluster
+		MDagPathArray influencePaths;
+		int numInfluences = skinCluster.influenceObjects(influencePaths, &status);
+		if (status != MS::kSuccess) {
+			itDep.next();
+			continue;
+		}
+
+		// Check if our joint is an influence
+		for (int i = 0; i < numInfluences; ++i) {
+			if (influencePaths[i].partialPathName() == jointName) {
+				unsigned int logicalIndex = skinCluster.indexForInfluenceObject(influencePaths[i], &status);
+				if (status != MS::kSuccess) {
+					continue;
+				}
+
+				MFnDependencyNode skinClusterDepNode(skinClusterObj);
+				MPlug bindPreMatrixPlug = skinClusterDepNode.findPlug("bindPreMatrix", &status);
+				if (status != MS::kSuccess) {
+					continue;
+				}
+
+				MPlug matrixPlug = bindPreMatrixPlug.elementByLogicalIndex(logicalIndex, &status);
+				if (status != MS::kSuccess) {
+					continue;
+				}
+
+				MObject matrixData;
+				status = matrixPlug.getValue(matrixData);
+				if (status != MS::kSuccess) {
+					continue;
+				}
+
+				MFnMatrixData matrixDataFn(matrixData);
+				MMatrix bindPreMatrix = matrixDataFn.matrix(&status);
+				if (status == MS::kSuccess) {
+					return bindPreMatrix;
+				}
+			}
+		}
+
+		itDep.next();
+	}
+
+	// Joint not found in any skin cluster
+	return MMatrix::identity;
 }
